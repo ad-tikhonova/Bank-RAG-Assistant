@@ -2,18 +2,17 @@ import os
 import logging
 import shutil
 from typing import List
+
+# Стабильные импорты
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 
 # --- 1. ЛОГИРОВАНИЕ ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.FileHandler("project_debug.log", encoding='utf-8'), logging.StreamHandler()])
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- 2. КОНФИГУРАЦИЯ ---
@@ -25,52 +24,78 @@ class NeoStackRAG:
     def __init__(self):
         self.embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-        logger.info("RAG система инициализирована.")
+        self.vectorstore = None
+        self.bm25_retriever = None
 
     def prepare_database(self):
+        logger.info("Загрузка документов...")
         loader = DirectoryLoader(DATA_PATH, glob="./*.txt", loader_cls=TextLoader, loader_kwargs={'encoding': 'utf-8'})
         documents = loader.load()
         for doc in documents:
             doc.metadata["source_file"] = os.path.basename(doc.metadata.get("source", "unknown"))
+
         chunks = self.text_splitter.split_documents(documents)
         if os.path.exists(DB_PATH): shutil.rmtree(DB_PATH)
+        
         self.vectorstore = Chroma.from_documents(chunks, self.embeddings, persist_directory=DB_PATH)
         self.bm25_retriever = BM25Retriever.from_documents(chunks)
-        return self.vectorstore.as_retriever(search_kwargs={"k": 3})
+        self.bm25_retriever.k = 2
+        return chunks
 
-    def format_docs(self, docs):
-        """Форматирование найденных документов для промпта (Этап 3.2)"""
-        return "\n\n".join(f"Из файла {d.metadata['source_file']}:\n{d.page_content}" for d in docs)
+    def hybrid_search(self, query: str) -> List[Document]:
+        """Гибридный поиск (Этап 2)"""
+        # Векторный поиск
+        vec_results = self.vectorstore.similarity_search(query, k=2)
+        # Поиск по ключевым словам (BM25)
+        bm25_results = self.bm25_retriever.invoke(query)
+        
+        # Слияние
+        combined = vec_results + bm25_results
+        unique_results = []
+        seen_content = set()
+        for doc in combined:
+            if doc.page_content not in seen_content:
+                unique_results.append(doc)
+                seen_content.add(doc.page_content)
+        return unique_results[:3]
 
-# --- 3. СИСТЕМНЫЙ ПРОМПТ (Этап 3.1) ---
-template = """Вы профессиональный банковский консультант NeoStack Bank. 
-Используйте только предоставленный контекст для ответа. Если ответа нет в тексте, вежливо скажите, что не владеете этой информацией.
-
-КОНТЕКСТ:
-{context}
-
-ВОПРОС КЛИЕНТА: {question}
-
-ОТВЕТ (будьте вежливы, используйте списки):"""
-
-prompt = ChatPromptTemplate.from_template(template)
-
-if __name__ == "__main__":
-    rag = NeoStackRAG()
-    retriever = rag.prepare_database()
+# --- 3. ЭТАП 4: МЕТРИКИ ---
+def evaluate_retrieval(rag_system):
+    print("\n" + "="*50)
+    print("ЭТАП 4: ОЦЕНКА КАЧЕСТВА ПОИСКА (METRICS)")
+    print("="*50)
     
-    # Эмуляция ответа без платной LLM для проверки логики (для демонстрации)
-    def mock_llm_chain(query):
-        docs = retriever.invoke(query)
-        context = rag.format_docs(docs)
-        print(f"\n--- ИСПОЛЬЗУЕМЫЙ КОНТЕКСТ ДЛЯ LLM ---")
-        print(context)
-        print(f"\n--- СИСТЕМНЫЙ ОТВЕТ (Этап 3) ---")
-        if "2-НДФЛ" in query:
-            return "Для оформления кредита свыше 500 000 рублей вам обязательно потребуется справка 2-НДФЛ. До этой суммы достаточно только паспорта РФ."
-        return "Я изучил базу знаний. Вот что удалось найти: " + docs[0].page_content[:200]
+    ground_truth = [
+        {"query": "справка 2-НДФЛ", "expected": "credit_universal_terms.txt"},
+        {"query": "потерял карту", "expected": "bank_fq_support.txt"},
+        {"query": "ставка для молодежи", "expected": "junior-investor.txt"},
+        {"query": "реферальная программа", "expected": "loyalty.txt"}
+    ]
 
-    # ТЕСТ
-    user_query = "Нужна ли справка 2-НДФЛ для кредита?"
-    answer = mock_llm_chain(user_query)
-    print(answer)
+    hits = 0
+    mrr_score = 0
+    for item in ground_truth:
+        results = rag_system.hybrid_search(item["query"])
+        sources = [doc.metadata.get("source_file") for doc in results]
+        
+        if item["expected"] in sources:
+            hits += 1
+            rank = sources.index(item["expected"]) + 1
+            mrr_score += 1 / rank
+        print(f"Запрос: {item['query']} | Найдено: {sources}")
+
+    print(f"\nИТОГ: Hit Rate@3 = {(hits/len(ground_truth))*100}% | MRR = {mrr_score/len(ground_truth):.2f}")
+
+# --- 4. ЗАПУСК ---
+if __name__ == "__main__":
+    if os.path.exists(DATA_PATH):
+        rag = NeoStackRAG()
+        rag.prepare_database()
+        
+        # Тестовый запрос (Этап 3)
+        print("\n--- ТЕСТОВЫЙ ЗАПРОС ---")
+        res = rag.hybrid_search("Нужна ли справка 2-НДФЛ?")
+        print(f"Ответ найден в: {res[0].metadata['source_file']}")
+        
+        # Метрики (Этап 4)
+        evaluate_retrieval(rag)
